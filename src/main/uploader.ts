@@ -131,6 +131,7 @@ export class MinidumpUploader {
 
       // If we were successful, we can try to flush the remaining queue
       if (response.ok) {
+        logger.log('Minidump uploaded', request.path);
         await this.flushQueue();
       }
     } catch (err) {

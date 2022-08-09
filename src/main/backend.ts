@@ -9,9 +9,16 @@ import {
 } from '@sentry/core';
 import { NodeBackend } from '@sentry/node';
 import { Event, EventHint, Severity, Transport, TransportOptions } from '@sentry/types';
-import { Dsn, forget, logger, parseSemver, SentryError } from '@sentry/utils';
+import { Dsn, forget, logger, SentryError } from '@sentry/utils';
 import { app, crashReporter, ipcMain } from 'electron';
 import { join } from 'path';
+import {
+  CRASH_REASONS,
+  getCrashesDirectory,
+  onChildProcessGone,
+  onRendererProcessGone,
+  onWebContentsCreated,
+} from '../electron-normalize';
 
 import { CommonBackend, ElectronOptions, getNameFallback, IPC_EVENT, IPC_PING, IPC_SCOPE } from '../common';
 
@@ -188,7 +195,7 @@ export class MainBackend extends BaseBackend<ElectronOptions> implements CommonB
       // The crashReporter has a method to retrieve the directory
       // it uses to store minidumps in. The structure in this directory depends
       // on the crash library being used (Crashpad or Breakpad).
-      const crashesDirectory = crashReporter.getCrashesDirectory();
+      const crashesDirectory = getCrashesDirectory();
 
       this._uploader = new MinidumpUploader(dsn, crashesDirectory, getCachePath());
 
@@ -203,36 +210,46 @@ export class MainBackend extends BaseBackend<ElectronOptions> implements CommonB
     /**
      * Helper function for sending renderer crashes
      */
-    const sendRendererCrash = async (contents: Electron.WebContents, details?: Electron.Details) => {
+    const sendRendererProcessCrash = async (
+      contents: Electron.WebContents,
+      details?: Electron.RenderProcessGoneDetails,
+    ) => {
       try {
-        await this._sendNativeCrashes(this._getNewEventWithElectronContext(contents, details));
+        await this._sendNativeCrashes(this._getNewEventWithRendererContext(contents, details));
       } catch (e) {
-        console.error(e);
+        logger.error(e);
       }
 
       addBreadcrumb({
         category: 'exception',
         level: Severity.Critical,
-        message: 'Renderer Crashed',
+        message: 'RendererProcess Crashed',
+      });
+    };
+
+    const sendChildProcessCrash = async (details: Electron.Details) => {
+      try {
+        await this._sendNativeCrashes(this._getNewEventWithChildContext(details));
+      } catch (e) {
+        logger.error(e);
+      }
+      addBreadcrumb({
+        category: 'exception',
+        level: Severity.Fatal,
+        message: `ChildProcess ${details.type} ${details.reason}`,
       });
     };
 
     // Every time a subprocess or renderer crashes, start sending minidumps
     // right away.
-    app.on('web-contents-created', (_, contents) => {
-      const version = parseSemver(process.versions.electron);
-      const major = version.major || 0;
-      const minor = version.minor || 0;
-      if ((major === 8 && minor >= 4) || (major === 9 && minor >= 1) || major >= 10) {
-        contents.on('render-process-gone', async (_event, details) => {
-          await sendRendererCrash(contents, details);
-        });
-      } else {
-        contents.on('crashed', async () => {
-          await sendRendererCrash(contents);
-        });
-      }
+    onRendererProcessGone(CRASH_REASONS, async (contents, details) => {
+      await sendRendererProcessCrash(contents, details);
+    });
+    onChildProcessGone(CRASH_REASONS, async details => {
+      await sendChildProcessCrash(details as Electron.Details);
+    });
 
+    onWebContentsCreated(contents => {
       if (this._options.enableUnresponsive !== false) {
         contents.on('unresponsive', () => {
           captureMessage('BrowserWindow Unresponsive');
@@ -259,7 +276,7 @@ export class MainBackend extends BaseBackend<ElectronOptions> implements CommonB
       }
 
       event.contexts = {
-        ...this._getNewEventWithElectronContext(ipc.sender).contexts,
+        ...this._getNewEventWithRendererContext(ipc.sender).contexts,
         ...event.contexts,
       };
 
@@ -333,7 +350,10 @@ export class MainBackend extends BaseBackend<ElectronOptions> implements CommonB
   }
 
   /** Returns extra information from a renderer's web contents. */
-  private _getNewEventWithElectronContext(contents: Electron.WebContents, details?: Electron.Details): Event {
+  private _getNewEventWithRendererContext(
+    contents: Electron.WebContents,
+    details?: Electron.RenderProcessGoneDetails,
+  ): Event {
     const customName = this._options.getRendererName && this._options.getRendererName(contents);
     const electronContext: Record<string, any> = {
       crashed_process: customName || `renderer[${contents.id}]`,
@@ -344,6 +364,22 @@ export class MainBackend extends BaseBackend<ElectronOptions> implements CommonB
       electronContext.details = details;
     }
     return {
+      extra: {
+        crashed_process: 'renderer',
+      },
+      contexts: {
+        electron: electronContext,
+      },
+    };
+  }
+
+  private _getNewEventWithChildContext(details: Electron.Details): Event {
+    const electronContext: Record<string, any> = {
+      crashed_process: details.name || details.type,
+      details,
+    };
+    return {
+      extra: { crashed_process: details.type },
       contexts: {
         electron: electronContext,
       },
