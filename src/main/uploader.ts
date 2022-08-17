@@ -104,12 +104,13 @@ export class MinidumpUploader {
    */
   public async uploadMinidump(request: MinidumpRequest): Promise<void> {
     logger.log('Uploading minidump', request.path);
-
+    let stream = fs.createReadStream(request.path);
     try {
       const body = new FormData();
-      body.append('upload_file_minidump', fs.createReadStream(request.path));
+      body.append('upload_file_minidump', stream);
       body.append('sentry', JSON.stringify(request.event));
       const response = await fetch(this._url, { method: 'POST', body });
+      stream.close();
 
       // Too many requests, so we queue the event and send it later
       if (response.status === CODE_RETRY) {
@@ -136,6 +137,7 @@ export class MinidumpUploader {
       }
     } catch (err) {
       logger.warn('Failed to upload minidump', err);
+      stream.close();
 
       // User's internet connection was down so we queue it as well
       const error = err ? (err as { code: string }) : { code: '' };
